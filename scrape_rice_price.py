@@ -7,9 +7,8 @@ Scheduling contract (enforced by modal_scraper.py, not this script):
 
 Behaviour:
   1. If today's price already exists in Supabase, do nothing.
-  2. Otherwise, scrape the PIHPS report for today's date, with the date
-     range explicitly set (not relying on the site's default view, which
-     does not reliably include the current date).
+  2. Otherwise, scrape the PIHPS report using the site's default view
+     (same approach as the proven working script - no date filter is set).
   3. If today's price is found on the site, upsert it.
   4. If today's price is NOT found (e.g. BI has not published yet):
        - Primary run (13:00)  -> exit quietly, let the 16:00 retry handle it.
@@ -17,13 +16,6 @@ Behaviour:
                                   most recent known price per rice type, so the table
                                   is never left empty for a given date (weekends,
                                   national holidays, or any other reporting gap).
-
-Column matching note:
-  Grid column headers are matched by PARSING a date out of the header text
-  (via regex) and comparing it to the target date object, rather than by
-  exact string equality. This avoids failures caused by invisible formatting
-  differences (extra/non-breaking spaces, different separators, etc.) between
-  what the site renders and what the code expects.
 """
 
 import argparse
@@ -78,7 +70,6 @@ def build_driver() -> webdriver.Chrome:
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 
-    # Auto-detect Chrome binary location across environments.
     chrome_path = (
         shutil.which("google-chrome-stable")
         or shutil.which("google-chrome")
@@ -93,7 +84,7 @@ def build_driver() -> webdriver.Chrome:
 
 
 # ==========================================
-# PIHPS scraping helpers
+# PIHPS scraping helpers (same approach as the proven working script)
 # ==========================================
 def select_treelist_item(driver, container_id: str, target_text: str, timeout: int = 10) -> bool:
     """Select an item inside a DevExtreme TreeList filter (e.g. commodity, province, city)."""
@@ -120,36 +111,12 @@ def select_treelist_item(driver, container_id: str, target_text: str, timeout: i
         return False
 
 
-def set_devextreme_date(driver, container_id: str, target_date: datetime) -> bool:
-    """
-    Set a DevExtreme DateBox widget's value via its JS API.
-    The start/end date fields (dboDateMulai / dboDateSelesai) are dx-datebox
-    widgets (a <div>), not plain <input> elements, so send_keys() does not work.
-    """
-    year, month_zero_indexed, day = target_date.year, target_date.month - 1, target_date.day
-    js_script = f"""
-    try {{
-        var picker = $('#{container_id}').dxDateBox('instance');
-        picker.option('value', new Date({year}, {month_zero_indexed}, {day}));
-        return true;
-    }} catch (err) {{
-        return false;
-    }}
-    """
-    success = driver.execute_script(js_script)
-    time.sleep(1)
-    return success
-
-
 def extract_price_grid(driver) -> pd.DataFrame | None:
     """
     Read the DevExpress data grid directly from its JS instance.
-    This avoids DOM/HTML column-alignment issues seen with table scraping.
-
     Date columns are identified by EXCLUDING the known identifier columns
-    ("No" and "Komoditas (Rp)"), rather than by requiring a specific
-    character (like '/') in the caption. This is more robust to formatting
-    differences the site might use for date headers.
+    ("No" and "Komoditas (Rp)"), which is more robust than requiring a
+    specific character in the caption.
     """
     js_script = """
     try {
@@ -191,8 +158,12 @@ def extract_price_grid(driver) -> pd.DataFrame | None:
     return None
 
 
-def scrape_price_grid(driver, target_date: datetime) -> pd.DataFrame | None:
-    """Run the full filter-and-extract flow on the PIHPS report page for a specific date."""
+def scrape_price_grid(driver) -> pd.DataFrame | None:
+    """
+    Run the full filter-and-extract flow on the PIHPS report page.
+    No date filter is set here - this mirrors the proven working script,
+    which relies on the site's own default report period.
+    """
     log(f"Opening {SOURCE_URL} ...")
     driver.get(SOURCE_URL)
     time.sleep(5)  # initial JS render
@@ -205,10 +176,6 @@ def scrape_price_grid(driver, target_date: datetime) -> pd.DataFrame | None:
     select_treelist_item(driver, "CommodityTree", COMMODITY)
     select_treelist_item(driver, "cboProvince", PROVINCE)
     select_treelist_item(driver, "cboRegency", REGENCY_CITY)
-
-    log(f"Setting date range to {target_date:%d/%m/%Y} ...")
-    set_devextreme_date(driver, "dboDateMulai", target_date)
-    set_devextreme_date(driver, "dboDateSelesai", target_date)
 
     log("Clicking 'Lihat Laporan' (#btnReport) ...")
     report_button = WebDriverWait(driver, 10).until(
@@ -239,9 +206,8 @@ def clean_price(raw_value) -> float | None:
 
 def parse_date_from_header(header_text: str) -> date | None:
     """
-    Extract a date (day, month, year) from a column header, regardless of the
-    exact separator or spacing used (e.g. '31/07/2026', '31 / 07 / 2026').
-    Returns None if no date-like pattern is found.
+    Extract a date from a column header regardless of separator/spacing
+    (e.g. '31/07/2026', '31 / 07 / 2026'). Returns None if no date is found.
     """
     match = re.search(r"(\d{1,2})\D+(\d{1,2})\D+(\d{4})", str(header_text))
     if not match:
@@ -384,19 +350,19 @@ def main(allow_fallback: bool = False) -> None:
     driver = None
     try:
         driver = build_driver()
-        grid = scrape_price_grid(driver, now)
+        grid = scrape_price_grid(driver)
     except Exception as error:
         log(f"Scraping failed with an error: {error}")
     finally:
         if driver is not None:
             driver.quit()
 
-    # --- Diagnostics: make failures visible instead of a silent "no data" ---
+    # --- Diagnostics: always show what was actually retrieved ---
     if grid is None:
         log("Grid extraction returned None (JS extraction failed or grid had no rows).")
     else:
         log(f"Grid extracted successfully. Columns found: {grid.columns.tolist()}")
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     price_column = find_todays_price_column(grid, today_date) if grid is not None else None
 

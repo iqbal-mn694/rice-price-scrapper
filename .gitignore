@@ -7,6 +7,6 @@ debug_screenshot.png
 
 # Local environment variables (kalau kamu bikin file .env buat testing lokal)
 .env
-
+.venv
 # OS files
 .DS_Store
