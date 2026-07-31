@@ -1,0 +1,64 @@
+name: Scrape Daily Rice Price
+
+on:
+  schedule:
+    # GitHub Actions cron uses UTC. WIB = UTC+7.
+    - cron: "0 6 * * *"   # 13:00 WIB - primary scraping attempt
+    - cron: "0 9 * * *"   # 16:00 WIB - retry attempt with fallback fill
+  workflow_dispatch:
+    inputs:
+      allow_fallback:
+        description: "Forward-fill with the last known price if today's data is unavailable"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Google Chrome
+        run: |
+          wget -q -O /tmp/google-chrome-stable_current_amd64.deb \
+            https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get update
+          sudo apt-get install -y /tmp/google-chrome-stable_current_amd64.deb
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # The 16:00 WIB cron run (09:00 UTC) is the last attempt of the day,
+      # so it is allowed to forward-fill missing data. Manual runs use the
+      # workflow_dispatch input instead.
+      - name: Determine whether fallback fill is allowed
+        id: run_mode
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 9 * * *" ] || [ "${{ github.event.inputs.allow_fallback }}" = "true" ]; then
+            echo "flag=--allow-fallback" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python scrape_rice_price.py ${{ steps.run_mode.outputs.flag }}
+
+      - name: Upload debug screenshot (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshot
+          path: debug_screenshot.png
+          if-no-files-found: ignore

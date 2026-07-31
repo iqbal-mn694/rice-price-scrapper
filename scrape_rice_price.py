@@ -1,0 +1,358 @@
+"""
+Automated daily rice price scraper for PIHPS (Bank Indonesia) -> Supabase.
+
+Scheduling contract (enforced by the GitHub Actions workflow, not this script):
+  - Run #1 at 13:00 WIB : primary attempt, `--allow-fallback` NOT set.
+  - Run #2 at 16:00 WIB : retry attempt, `--allow-fallback` IS set.
+
+Behaviour:
+  1. If today's price already exists in Supabase, do nothing.
+  2. Otherwise, scrape the PIHPS report for today's date.
+  3. If today's price is found on the site, upsert it.
+  4. If today's price is NOT found (e.g. BI has not published yet):
+       - Primary run (13:00)  -> exit quietly, let the 16:00 retry handle it.
+       - Retry run (16:00)    -> if --allow-fallback is set, forward-fill using the
+                                  most recent known price per rice type, so the table
+                                  is never left empty for a given date (weekends,
+                                  national holidays, or any other reporting gap).
+"""
+
+import argparse
+import re
+import shutil
+import sys
+import time
+from datetime import datetime
+
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from supabase import Client, create_client
+from webdriver_manager.chrome import ChromeDriverManager
+
+from config import (
+    COMMODITY,
+    PROVINCE,
+    REGENCY_CITY,
+    RICE_TYPE_MAP,
+    SOURCE_URL,
+    SUPABASE_SERVICE_ROLE_KEY,
+    SUPABASE_URL,
+    TABLE_RICE_PRICES,
+)
+
+
+# ==========================================
+# Logging helper
+# ==========================================
+def log(message: str) -> None:
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}")
+
+
+# ==========================================
+# Selenium driver setup
+# ==========================================
+def build_driver() -> webdriver.Chrome:
+    """Build a headless Chrome driver suitable for CI environments."""
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    # Auto-detect Chrome binary location across environments.
+    chrome_path = (
+        shutil.which("google-chrome-stable")
+        or shutil.which("google-chrome")
+        or shutil.which("chromium")
+        or shutil.which("chromium-browser")
+    )
+    if chrome_path:
+        options.binary_location = chrome_path
+
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=options)
+
+
+# ==========================================
+# PIHPS scraping helpers
+# ==========================================
+def select_treelist_item(driver, container_id: str, target_text: str, timeout: int = 10) -> bool:
+    """Select an item inside a DevExtreme TreeList filter (e.g. commodity, province, city)."""
+    try:
+        xpath = (
+            f"//div[@id='{container_id}']"
+            f"//div[contains(@class, 'dx-treelist-text-content') "
+            f"and normalize-space(text())='{target_text}']"
+        )
+        text_element = WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.XPATH, xpath))
+        )
+        row_element = text_element.find_element(By.XPATH, "./ancestor::tr")
+        checkbox = row_element.find_element(By.CSS_SELECTOR, ".dx-select-checkbox")
+
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkbox)
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", checkbox)
+        log(f"Selected '{target_text}' in #{container_id}")
+        time.sleep(2.5)
+        return True
+    except Exception as error:
+        log(f"Failed to select '{target_text}' in #{container_id}: {error}")
+        return False
+
+
+def extract_price_grid(driver) -> pd.DataFrame | None:
+    """
+    Read the DevExpress data grid directly from its JS instance.
+    This avoids DOM/HTML column-alignment issues seen with table scraping.
+    """
+    js_script = """
+    try {
+        var grid = $("#grid1").dxDataGrid("instance");
+        var visibleColumns = grid.getVisibleColumns();
+        var visibleRows = grid.getVisibleRows();
+
+        var headers = ["No", "Komoditas (Rp)"];
+        var dateColumns = [];
+
+        visibleColumns.forEach(function (col) {
+            if (col.caption && col.caption.indexOf('/') !== -1) {
+                headers.push(col.caption.replace(/\\s+/g, ''));
+                dateColumns.push(col.dataField);
+            }
+        });
+
+        var rows = [];
+        visibleRows.forEach(function (row) {
+            if (row.rowType === "data") {
+                var rowValues = [row.data.no || "", row.data.name || ""];
+                dateColumns.forEach(function (field) {
+                    var value = row.data[field];
+                    rowValues.push((value !== undefined && value !== null && value !== "") ? value : "-");
+                });
+                rows.push(rowValues);
+            }
+        });
+
+        return { headers: headers, rows: rows };
+    } catch (err) {
+        return null;
+    }
+    """
+    result = driver.execute_script(js_script)
+    if result and result.get("rows"):
+        return pd.DataFrame(result["rows"], columns=result["headers"])
+    return None
+
+
+def scrape_price_grid(driver) -> pd.DataFrame | None:
+    """Run the full filter-and-extract flow on the PIHPS report page."""
+    log(f"Opening {SOURCE_URL} ...")
+    driver.get(SOURCE_URL)
+    time.sleep(5)  # initial JS render
+
+    iframes = driver.find_elements(By.TAG_NAME, "iframe")
+    if iframes:
+        driver.switch_to.frame(iframes[0])
+
+    log("Filling in report filters ...")
+    select_treelist_item(driver, "CommodityTree", COMMODITY)
+    select_treelist_item(driver, "cboProvince", PROVINCE)
+    select_treelist_item(driver, "cboRegency", REGENCY_CITY)
+
+    log("Clicking 'Lihat Laporan' (#btnReport) ...")
+    report_button = WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.ID, "btnReport"))
+    )
+    driver.execute_script("arguments[0].click();", report_button)
+
+    log("Waiting for the grid to finish loading ...")
+    WebDriverWait(driver, 20).until(
+        EC.invisibility_of_element_located((By.ID, "loadingDiv"))
+    )
+    time.sleep(3)
+
+    return extract_price_grid(driver)
+
+
+# ==========================================
+# Data transformation helpers
+# ==========================================
+def clean_price(raw_value) -> float | None:
+    """Convert a raw grid cell (e.g. '14,600') into a float, or None if unavailable."""
+    text = str(raw_value).strip()
+    if text in ("-", "", "None", "nan"):
+        return None
+    digits_only = re.sub(r"[^\d]", "", text)
+    return float(digits_only) if digits_only else None
+
+
+def find_todays_price_column(grid: pd.DataFrame, today_display: str) -> str | None:
+    """Return the grid column name matching today's date (DD/MM/YYYY, no separators), if present."""
+    expected_column = today_display.replace("/", "")
+    return expected_column if expected_column in grid.columns else None
+
+
+def build_records_from_grid(
+    grid: pd.DataFrame, price_column: str, today_iso: str
+) -> list[dict]:
+    """Turn today's price column into long-format records ready for Supabase upsert."""
+    records = []
+    for _, row in grid.iterrows():
+        rice_type_name = str(row["Komoditas (Rp)"]).strip()
+        rice_type_id = RICE_TYPE_MAP.get(rice_type_name)
+        if rice_type_id is None:
+            continue  # skips the aggregate "Beras" parent row and any unmapped entries
+
+        price = clean_price(row[price_column])
+        if price is None:
+            continue
+
+        records.append(
+            {
+                "date": today_iso,
+                "rice_type_id": rice_type_id,
+                "price": price,
+            }
+        )
+    return records
+
+
+# ==========================================
+# Supabase helpers
+# ==========================================
+def get_supabase_client() -> Client:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError(
+            "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variable."
+        )
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+def has_data_for_today(supabase: Client, today_iso: str) -> bool:
+    """Check whether today's price has already been stored, regardless of source."""
+    response = (
+        supabase.table(TABLE_RICE_PRICES)
+        .select("id")
+        .eq("date", today_iso)
+        .limit(1)
+        .execute()
+    )
+    return len(response.data) > 0
+
+
+def get_last_known_prices(supabase: Client, rice_type_ids: list[int]) -> dict[int, float]:
+    """Fetch the most recent known price for each rice type (used for forward-fill fallback)."""
+    last_known_prices: dict[int, float] = {}
+    for rice_type_id in rice_type_ids:
+        response = (
+            supabase.table(TABLE_RICE_PRICES)
+            .select("price")
+            .eq("rice_type_id", rice_type_id)
+            .order("date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            last_known_prices[rice_type_id] = response.data[0]["price"]
+    return last_known_prices
+
+
+def build_fallback_records(today_iso: str, last_known_prices: dict[int, float]) -> list[dict]:
+    """Build forward-filled records for rice types with no data published today."""
+    return [
+        {
+            "date": today_iso,
+            "rice_type_id": rice_type_id,
+            "price": price,
+        }
+        for rice_type_id, price in last_known_prices.items()
+    ]
+
+
+def upsert_rice_prices(supabase: Client, records: list[dict]) -> None:
+    if not records:
+        log("No records to upsert.")
+        return
+    supabase.table(TABLE_RICE_PRICES).upsert(
+        records, on_conflict="date,rice_type_id"
+    ).execute()
+    log(f"Upserted {len(records)} record(s) into '{TABLE_RICE_PRICES}'.")
+
+
+# ==========================================
+# Main orchestration
+# ==========================================
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Scrape today's rice price from PIHPS into Supabase.")
+    parser.add_argument(
+        "--allow-fallback",
+        action="store_true",
+        help="If today's price is not yet published, forward-fill using the last known price.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    now = datetime.now()
+    today_display = now.strftime("%d/%m/%Y")  # format used by the PIHPS website
+    today_iso = now.strftime("%Y-%m-%d")       # format used by the database
+
+    supabase = get_supabase_client()
+
+    if has_data_for_today(supabase, today_iso):
+        log(f"Data for {today_iso} already stored. Nothing to do.")
+        return
+
+    grid = None
+    driver = None
+    try:
+        driver = build_driver()
+        grid = scrape_price_grid(driver)
+    except Exception as error:
+        log(f"Scraping failed with an error: {error}")
+    finally:
+        if driver is not None:
+            driver.quit()
+
+    price_column = find_todays_price_column(grid, today_display) if grid is not None else None
+
+    if price_column is not None:
+        records = build_records_from_grid(grid, price_column, today_iso)
+        if records:
+            upsert_rice_prices(supabase, records)
+            log(f"Successfully scraped and stored data for {today_iso}.")
+            return
+        log("Today's column was found but contained no usable prices.")
+
+    # Today's data is not available on the site yet.
+    if not args.allow_fallback:
+        log(f"No data published for {today_iso} yet. Will retry on the next scheduled run.")
+        return
+
+    log(f"No data published for {today_iso}. Applying forward-fill fallback ...")
+    last_known_prices = get_last_known_prices(supabase, list(RICE_TYPE_MAP.values()))
+    fallback_records = build_fallback_records(today_iso, last_known_prices)
+
+    if not fallback_records:
+        log("No historical prices available to forward-fill from. Nothing was stored.")
+        sys.exit(1)
+
+    upsert_rice_prices(supabase, fallback_records)
+    log(f"Stored forward-filled data for {today_iso}.")
+
+
+if __name__ == "__main__":
+    main()
