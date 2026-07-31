@@ -17,6 +17,13 @@ Behaviour:
                                   most recent known price per rice type, so the table
                                   is never left empty for a given date (weekends,
                                   national holidays, or any other reporting gap).
+
+Column matching note:
+  Grid column headers are matched by PARSING a date out of the header text
+  (via regex) and comparing it to the target date object, rather than by
+  exact string equality. This avoids failures caused by invisible formatting
+  differences (extra/non-breaking spaces, different separators, etc.) between
+  what the site renders and what the code expects.
 """
 
 import argparse
@@ -24,7 +31,7 @@ import re
 import shutil
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 from selenium import webdriver
@@ -138,6 +145,11 @@ def extract_price_grid(driver) -> pd.DataFrame | None:
     """
     Read the DevExpress data grid directly from its JS instance.
     This avoids DOM/HTML column-alignment issues seen with table scraping.
+
+    Date columns are identified by EXCLUDING the known identifier columns
+    ("No" and "Komoditas (Rp)"), rather than by requiring a specific
+    character (like '/') in the caption. This is more robust to formatting
+    differences the site might use for date headers.
     """
     js_script = """
     try {
@@ -149,8 +161,9 @@ def extract_price_grid(driver) -> pd.DataFrame | None:
         var dateColumns = [];
 
         visibleColumns.forEach(function (col) {
-            if (col.caption && col.caption.indexOf('/') !== -1) {
-                headers.push(col.caption.replace(/\\s+/g, ''));
+            var isIdentifierColumn = (col.caption === 'No' || col.caption === 'Komoditas (Rp)');
+            if (col.dataField && !isIdentifierColumn) {
+                headers.push(col.caption || col.dataField);
                 dateColumns.push(col.dataField);
             }
         });
@@ -224,10 +237,29 @@ def clean_price(raw_value) -> float | None:
     return float(digits_only) if digits_only else None
 
 
-def find_todays_price_column(grid: pd.DataFrame, today_display: str) -> str | None:
-    """Return the grid column name matching today's date (DD/MM/YYYY, no separators), if present."""
-    expected_column = today_display.replace("/", "")
-    return expected_column if expected_column in grid.columns else None
+def parse_date_from_header(header_text: str) -> date | None:
+    """
+    Extract a date (day, month, year) from a column header, regardless of the
+    exact separator or spacing used (e.g. '31/07/2026', '31 / 07 / 2026').
+    Returns None if no date-like pattern is found.
+    """
+    match = re.search(r"(\d{1,2})\D+(\d{1,2})\D+(\d{4})", str(header_text))
+    if not match:
+        return None
+    day, month, year = (int(part) for part in match.groups())
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def find_todays_price_column(grid: pd.DataFrame, target_date: date) -> str | None:
+    """Return the grid column whose header date matches target_date, if present."""
+    for column_name in grid.columns:
+        column_date = parse_date_from_header(column_name)
+        if column_date == target_date:
+            return column_name
+    return None
 
 
 def build_records_from_grid(
@@ -339,8 +371,8 @@ def main(allow_fallback: bool = False) -> None:
             forward-fill using the most recent known price per rice type.
     """
     now = datetime.now()
-    today_display = now.strftime("%d/%m/%Y")  # format used by the PIHPS website
-    today_iso = now.strftime("%Y-%m-%d")       # format used by the database
+    today_date = now.date()
+    today_iso = now.strftime("%Y-%m-%d")  # format used by the database
 
     supabase = get_supabase_client()
 
@@ -359,7 +391,17 @@ def main(allow_fallback: bool = False) -> None:
         if driver is not None:
             driver.quit()
 
-    price_column = find_todays_price_column(grid, today_display) if grid is not None else None
+    # --- Diagnostics: make failures visible instead of a silent "no data" ---
+    if grid is None:
+        log("Grid extraction returned None (JS extraction failed or grid had no rows).")
+    else:
+        log(f"Grid extracted successfully. Columns found: {grid.columns.tolist()}")
+    # -------------------------------------------------------------------------
+
+    price_column = find_todays_price_column(grid, today_date) if grid is not None else None
+
+    if price_column is None and grid is not None:
+        log(f"No column matched today's date ({today_date:%d/%m/%Y}) among the columns above.")
 
     if price_column is not None:
         records = build_records_from_grid(grid, price_column, today_iso)
