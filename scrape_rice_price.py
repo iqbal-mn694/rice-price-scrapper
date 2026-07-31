@@ -303,9 +303,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def main(allow_fallback: bool = False) -> None:
+    """
+    Run the daily scrape-and-store routine.
 
+    Args:
+        allow_fallback: if True and today's price is not yet published,
+            forward-fill using the most recent known price per rice type.
+    """
     now = datetime.now()
     today_display = now.strftime("%d/%m/%Y")  # format used by the PIHPS website
     today_iso = now.strftime("%Y-%m-%d")       # format used by the database
@@ -338,7 +343,7 @@ def main() -> None:
         log("Today's column was found but contained no usable prices.")
 
     # Today's data is not available on the site yet.
-    if not args.allow_fallback:
+    if not allow_fallback:
         log(f"No data published for {today_iso} yet. Will retry on the next scheduled run.")
         return
 
@@ -355,4 +360,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # CLI usage (local testing):
+    #   python scrape_rice_price.py                  -> primary run behavior
+    #   python scrape_rice_price.py --allow-fallback  -> retry/fallback behavior
+    args = parse_args()
+    main(allow_fallback=args.allow_fallback)

@@ -1,3 +1,4 @@
+modal
 selenium
 webdriver-manager
 pandas
