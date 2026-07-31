@@ -1,17 +1,19 @@
 """
 Automated daily rice price scraper for PIHPS (Bank Indonesia) -> Supabase.
 
-Scheduling contract (enforced by the GitHub Actions workflow, not this script):
-  - Run #1 at 13:00 WIB : primary attempt, `--allow-fallback` NOT set.
-  - Run #2 at 16:00 WIB : retry attempt, `--allow-fallback` IS set.
+Scheduling contract (enforced by modal_scraper.py, not this script):
+  - Run #1 at 13:00 WIB : primary attempt, allow_fallback=False.
+  - Run #2 at 16:00 WIB : retry attempt, allow_fallback=True.
 
 Behaviour:
   1. If today's price already exists in Supabase, do nothing.
-  2. Otherwise, scrape the PIHPS report for today's date.
+  2. Otherwise, scrape the PIHPS report for today's date, with the date
+     range explicitly set (not relying on the site's default view, which
+     does not reliably include the current date).
   3. If today's price is found on the site, upsert it.
   4. If today's price is NOT found (e.g. BI has not published yet):
        - Primary run (13:00)  -> exit quietly, let the 16:00 retry handle it.
-       - Retry run (16:00)    -> if --allow-fallback is set, forward-fill using the
+       - Retry run (16:00)    -> if allow_fallback is set, forward-fill using the
                                   most recent known price per rice type, so the table
                                   is never left empty for a given date (weekends,
                                   national holidays, or any other reporting gap).
@@ -111,6 +113,27 @@ def select_treelist_item(driver, container_id: str, target_text: str, timeout: i
         return False
 
 
+def set_devextreme_date(driver, container_id: str, target_date: datetime) -> bool:
+    """
+    Set a DevExtreme DateBox widget's value via its JS API.
+    The start/end date fields (dboDateMulai / dboDateSelesai) are dx-datebox
+    widgets (a <div>), not plain <input> elements, so send_keys() does not work.
+    """
+    year, month_zero_indexed, day = target_date.year, target_date.month - 1, target_date.day
+    js_script = f"""
+    try {{
+        var picker = $('#{container_id}').dxDateBox('instance');
+        picker.option('value', new Date({year}, {month_zero_indexed}, {day}));
+        return true;
+    }} catch (err) {{
+        return false;
+    }}
+    """
+    success = driver.execute_script(js_script)
+    time.sleep(1)
+    return success
+
+
 def extract_price_grid(driver) -> pd.DataFrame | None:
     """
     Read the DevExpress data grid directly from its JS instance.
@@ -155,8 +178,8 @@ def extract_price_grid(driver) -> pd.DataFrame | None:
     return None
 
 
-def scrape_price_grid(driver) -> pd.DataFrame | None:
-    """Run the full filter-and-extract flow on the PIHPS report page."""
+def scrape_price_grid(driver, target_date: datetime) -> pd.DataFrame | None:
+    """Run the full filter-and-extract flow on the PIHPS report page for a specific date."""
     log(f"Opening {SOURCE_URL} ...")
     driver.get(SOURCE_URL)
     time.sleep(5)  # initial JS render
@@ -169,6 +192,10 @@ def scrape_price_grid(driver) -> pd.DataFrame | None:
     select_treelist_item(driver, "CommodityTree", COMMODITY)
     select_treelist_item(driver, "cboProvince", PROVINCE)
     select_treelist_item(driver, "cboRegency", REGENCY_CITY)
+
+    log(f"Setting date range to {target_date:%d/%m/%Y} ...")
+    set_devextreme_date(driver, "dboDateMulai", target_date)
+    set_devextreme_date(driver, "dboDateSelesai", target_date)
 
     log("Clicking 'Lihat Laporan' (#btnReport) ...")
     report_button = WebDriverWait(driver, 10).until(
@@ -325,7 +352,7 @@ def main(allow_fallback: bool = False) -> None:
     driver = None
     try:
         driver = build_driver()
-        grid = scrape_price_grid(driver)
+        grid = scrape_price_grid(driver, now)
     except Exception as error:
         log(f"Scraping failed with an error: {error}")
     finally:
@@ -360,7 +387,6 @@ def main(allow_fallback: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    # CLI usage (local testing):
     #   python scrape_rice_price.py                  -> primary run behavior
     #   python scrape_rice_price.py --allow-fallback  -> retry/fallback behavior
     args = parse_args()
