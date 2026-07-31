@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Debug artifacts
+debug_screenshot.png
+
+# Local environment variables (kalau kamu bikin file .env buat testing lokal)
+.env
+
+# OS files
+.DS_Store
