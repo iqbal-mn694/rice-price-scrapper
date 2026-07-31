@@ -3,8 +3,7 @@ name: Scrape Daily Rice Price
 on:
   schedule:
     # GitHub Actions cron uses UTC. WIB = UTC+7.
-    - cron: "0 6 * * *"   # 13:00 WIB - primary scraping attempt
-    - cron: "0 9 * * *"   # 16:00 WIB - retry attempt with fallback fill
+    - cron: "10 7 * * *"
   workflow_dispatch:
     inputs:
       allow_fallback:
