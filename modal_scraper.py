@@ -54,7 +54,7 @@ supabase_secret = modal.Secret.from_name("supabase-credentials")
 # ==========================================
 @app.function(
     image=scraper_image,
-    schedule=modal.Cron("30 7 * * *"),  # 13:00 WIB (cron runs in UTC)
+    schedule=modal.Cron("40 7 * * *"),  # 13:00 WIB (cron runs in UTC)
     secrets=[supabase_secret],
     timeout=600,
 )
